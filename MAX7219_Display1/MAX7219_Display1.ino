@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <ESP8266WiFi.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -8,6 +9,7 @@
 #include <math.h>
 #include <time.h>
 #include "ThermostatLogic.h"
+#include "SetpointStorage.h"
 
 // Vor dem Flashen pro Geraet aendern: 1 = Holzwerkstatt, 2 = Metallwerkstatt.
 constexpr uint8_t DISPLAY_NUMBER = 1;
@@ -17,7 +19,7 @@ static_assert(DISPLAY_NUMBER == 1 || DISPLAY_NUMBER == 2, "DISPLAY_NUMBER muss 1
 constexpr bool COOLING_MODE = false; // Heizluefter: Ein unter, Aus ueber dem Sollwert
 constexpr uint8_t RELAY_ON_LEVEL = HIGH;
 
-constexpr float DEFAULT_SETPOINT = 8.0f;   // Nach jedem Neustart wieder 8 C
+constexpr float DEFAULT_SETPOINT = 8.0f;   // Nur beim ersten Start ohne gespeicherten Wert
 constexpr float DEFAULT_HYSTERESIS = 2.0f; // Nach jedem Neustart wieder 2 C
 constexpr float MIN_SETPOINT = 0.0f;
 constexpr float MAX_SETPOINT = 40.0f;
@@ -67,6 +69,7 @@ char smartHomeSetpointTopic[32];
 char hostname[32];
 char willTopic[24];
 float setpoint = DEFAULT_SETPOINT;
+bool setpointPendingSmartHomeSync = false;
 float hysteresis = DEFAULT_HYSTERESIS;
 float insideTemperature = NAN;
 float outsideTemperature = NAN;
@@ -137,11 +140,51 @@ bool parseNumber(const char *message, float &value, float minimum, float maximum
   return *end == '\0' && value >= minimum && value <= maximum;
 }
 
-void setSetpoint(float value) {
+void saveSetpoint() {
+  StoredSetpoint stored = makeStoredSetpoint(static_cast<uint8_t>(setpoint), setpointPendingSmartHomeSync);
+  EEPROM.put(0, stored);
+  if (!EEPROM.commit()) Serial.println("Solltemperatur konnte nicht gespeichert werden");
+}
+
+void loadSetpoint() {
+  EEPROM.begin(sizeof(StoredSetpoint));
+  StoredSetpoint stored;
+  EEPROM.get(0, stored);
+  if (!validStoredSetpoint(stored)) return;
+  setpoint = stored.degrees;
+  setpointPendingSmartHomeSync = stored.pendingSmartHomeSync != 0;
+}
+
+bool publishSetpointToSmartHome() {
+  if (!mqtt.connected()) return false;
+  char value[8];
+  snprintf(value, sizeof(value), "%u", static_cast<unsigned>(setpoint));
+  return mqtt.publish(smartHomeSetpointTopic, value, true);
+}
+
+bool syncSetpointToSmartHome() {
+  if (!setpointPendingSmartHomeSync || !publishSetpointToSmartHome()) return false;
+  setpointPendingSmartHomeSync = false;
+  saveSetpoint();
+  return true;
+}
+
+void setSetpoint(float value, bool fromSmartHomeTopic = false) {
   if (!isfinite(value) || value < MIN_SETPOINT || value > MAX_SETPOINT) return;
   value = roundf(value / SETPOINT_STEP) * SETPOINT_STEP;
-  if (fabsf(value - setpoint) < 0.01f) return;
+  if (fabsf(value - setpoint) < 0.01f) {
+    if (fromSmartHomeTopic && setpointPendingSmartHomeSync) {
+      setpointPendingSmartHomeSync = false;
+      saveSetpoint();
+    }
+    return;
+  }
   setpoint = value;
+  setpointPendingSmartHomeSync = !fromSmartHomeTopic;
+  if (setpointPendingSmartHomeSync && publishSetpointToSmartHome()) {
+    setpointPendingSmartHomeSync = false;
+  }
+  saveSetpoint();
   publishFloat("solltemperatur", setpoint, 0, true);
   Serial.printf("Solltemperatur: %.1f C\n", setpoint);
 }
@@ -228,7 +271,9 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   if (strcmp(topic, smartHomeSetpointTopic) == 0 || topicIs(topic, "Solltemperatur") ||
       topicIs(topic, "solltemperatur/set")) {
     float value;
-    if (parseNumber(message, value, MIN_SETPOINT, MAX_SETPOINT)) setSetpoint(value);
+    if (parseNumber(message, value, MIN_SETPOINT, MAX_SETPOINT)) {
+      setSetpoint(value, strcmp(topic, smartHomeSetpointTopic) == 0);
+    }
   } else if (topicIs(topic, "hysterese/set")) {
     float value;
     if (parseNumber(message, value, MIN_HYSTERESIS, MAX_HYSTERESIS)) setHysteresis(value);
@@ -278,6 +323,11 @@ void maintainConnections(unsigned long now) {
   if (!elapsed(now, lastMqttAttempt, MQTT_RETRY_MS)) return;
   lastMqttAttempt = now;
   if (!mqtt.connect(ownRoot, willTopic, 0, true, "OFFLINE")) return;
+  // Lokale Aenderungen aus Offline-Phasen gehen vor einem alten retained MQTT-Wert vor.
+  if (setpointPendingSmartHomeSync && !syncSetpointToSmartHome()) {
+    mqtt.disconnect();
+    return;
+  }
   const char *inputs[] = {"text", "speed", "scroll", "intensity", "abstand",
                           "solltemperatur/set", "Solltemperatur", "hysterese/set"};
   char topic[48];
@@ -372,6 +422,7 @@ void setup() {
 
   digitalWrite(RELAY_PIN, RELAY_ON_LEVEL == HIGH ? LOW : HIGH);
   pinMode(RELAY_PIN, OUTPUT);
+  loadSetpoint();
   pinMode(MOTION_PIN, INPUT);
   pinMode(UP_PIN, INPUT_PULLUP);
   pinMode(DOWN_PIN, INPUT_PULLUP);
