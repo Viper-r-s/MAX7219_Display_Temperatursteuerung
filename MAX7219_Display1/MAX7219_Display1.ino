@@ -21,7 +21,7 @@ constexpr float DEFAULT_SETPOINT = 8.0f;   // Nach jedem Neustart wieder 8 C
 constexpr float DEFAULT_HYSTERESIS = 2.0f; // Nach jedem Neustart wieder 2 C
 constexpr float MIN_SETPOINT = 0.0f;
 constexpr float MAX_SETPOINT = 40.0f;
-constexpr float SETPOINT_STEP = 0.5f;
+constexpr float SETPOINT_STEP = 1.0f;
 constexpr float MIN_HYSTERESIS = 0.1f;
 constexpr float MAX_HYSTERESIS = 10.0f;
 
@@ -62,6 +62,7 @@ Button downButton = {DOWN_PIN, false, false, 0};
 
 char ownRoot[12];
 char otherRoot[12];
+char smartHomeSetpointTopic[32];
 char hostname[32];
 char willTopic[24];
 float setpoint = DEFAULT_SETPOINT;
@@ -140,7 +141,7 @@ void setSetpoint(float value) {
   value = roundf(value / SETPOINT_STEP) * SETPOINT_STEP;
   if (fabsf(value - setpoint) < 0.01f) return;
   setpoint = value;
-  publishFloat("solltemperatur", setpoint, 1, true);
+  publishFloat("solltemperatur", setpoint, 0, true);
   Serial.printf("Solltemperatur: %.1f C\n", setpoint);
 }
 
@@ -223,7 +224,8 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   message[length] = '\0';
   unsigned long now = millis();
 
-  if (topicIs(topic, "solltemperatur/set")) {
+  if (strcmp(topic, smartHomeSetpointTopic) == 0 || topicIs(topic, "Solltemperatur") ||
+      topicIs(topic, "solltemperatur/set")) {
     float value;
     if (parseNumber(message, value, MIN_SETPOINT, MAX_SETPOINT)) setSetpoint(value);
   } else if (topicIs(topic, "hysterese/set")) {
@@ -276,17 +278,18 @@ void maintainConnections(unsigned long now) {
   lastMqttAttempt = now;
   if (!mqtt.connect(ownRoot, willTopic, 0, true, "OFFLINE")) return;
   const char *inputs[] = {"text", "speed", "scroll", "intensity", "abstand",
-                          "solltemperatur/set", "hysterese/set"};
+                          "solltemperatur/set", "Solltemperatur", "hysterese/set"};
   char topic[48];
   for (const char *input : inputs) {
     snprintf(topic, sizeof(topic), "%s/%s", ownRoot, input);
     mqtt.subscribe(topic);
   }
+  mqtt.subscribe(smartHomeSetpointTopic);
   snprintf(topic, sizeof(topic), "%s/relais", otherRoot);
   mqtt.subscribe(topic);
   mqtt.subscribe("tele/schalter2/SENSOR");
   publish("LWT", "ONLINE", true);
-  publishFloat("solltemperatur", setpoint, 1, true);
+  publishFloat("solltemperatur", setpoint, 0, true);
   publishFloat("hysterese", hysteresis, 1, true);
   publishRelay();
   publish("bewegung", motionActive ? "1" : "0");
@@ -361,6 +364,7 @@ void setup() {
   Serial.begin(115200);
   snprintf(ownRoot, sizeof(ownRoot), "display%u", DISPLAY_NUMBER);
   snprintf(otherRoot, sizeof(otherRoot), "display%u", DISPLAY_NUMBER == 1 ? 2 : 1);
+  snprintf(smartHomeSetpointTopic, sizeof(smartHomeSetpointTopic), "Display%u/Solltemperatur", DISPLAY_NUMBER);
   snprintf(hostname, sizeof(hostname), "Werkstatt-%s-Display%u",
            DISPLAY_NUMBER == 1 ? "Holz" : "Metall", DISPLAY_NUMBER);
   snprintf(willTopic, sizeof(willTopic), "%s/LWT", ownRoot);
