@@ -8,7 +8,7 @@ In `MAX7219_Display1/MAX7219_Display1.ino` `DISPLAY_NUMBER` auf `1` (Holz) oder 
 
 Verdrahtung aus dem bisherigen Sketch: DHT22 GPIO0; Relais GPIO5; Bewegungsmelder GPIO4; Taster Hoch GPIO3 und Runter GPIO2 (gegen GND, interne Pull-ups); Matrix DIN D7, CS D8, CLK D5. GPIO2 muss zum Booten HIGH sein; beim Einschalten den Runter-Taster nicht gedrückt halten.
 
-`COOLING_MODE = false` und `RELAY_ON_LEVEL = HIGH`: Der Heizlüfter schaltet bei 8 °C Sollwert und 2 °C Hysterese bei **6 °C oder weniger ein** und bei **8 °C oder mehr aus**. Dazwischen bleibt der bisherige Zustand erhalten. Bei fehlenden gültigen DHT22-Werten über 15 Sekunden schaltet das Relais aus. Die Taster ändern den Sollwert lokal in 1-°C-Schritten. Nach jedem Neustart startet das Gerät mit 8 °C Sollwert und 2 °C Hysterese; Änderungen werden nicht lokal gespeichert. Ein anschließend empfangener MQTT-Sollwert übernimmt die Regelung sofort.
+`COOLING_MODE = false` und `RELAY_ON_LEVEL = HIGH`: Der Heizlüfter schaltet bei 8 °C Sollwert und 2 °C Hysterese bei **7 °C oder weniger ein** und bei **9 °C oder mehr aus**. Die Hysterese bezeichnet die gesamte Spanne zwischen beiden Schaltpunkten und liegt symmetrisch um den Sollwert. Dazwischen bleibt der bisherige Zustand erhalten. Bei fehlenden gültigen DHT22-Werten über 15 Sekunden schaltet das Relais aus. Die Taster ändern den Sollwert lokal in 1-°C-Schritten. Nach jedem Neustart startet das Gerät mit 8 °C Sollwert und 2 °C Hysterese; Änderungen werden nicht lokal gespeichert. Ein anschließend empfangener MQTT-Sollwert übernimmt die Regelung sofort.
 
 ## MQTT
 

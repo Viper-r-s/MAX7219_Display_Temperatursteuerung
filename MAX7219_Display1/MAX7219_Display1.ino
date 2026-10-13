@@ -14,7 +14,7 @@ constexpr uint8_t DISPLAY_NUMBER = 1;
 static_assert(DISPLAY_NUMBER == 1 || DISPLAY_NUMBER == 2, "DISPLAY_NUMBER muss 1 oder 2 sein");
 
 // Diese zwei Werte muessen zur tatsaechlichen Relais-/Luefterverdrahtung passen.
-constexpr bool COOLING_MODE = false; // Heizluefter: Ein unter Soll, Aus ab Soll
+constexpr bool COOLING_MODE = false; // Heizluefter: Ein unter, Aus ueber dem Sollwert
 constexpr uint8_t RELAY_ON_LEVEL = HIGH;
 
 constexpr float DEFAULT_SETPOINT = 8.0f;   // Nach jedem Neustart wieder 8 C
@@ -40,6 +40,7 @@ constexpr unsigned long WIFI_RETRY_MS = 15000;
 constexpr unsigned long MOTION_OFF_DELAY_MS = 20000;
 constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
 constexpr unsigned long MATRIX_MUTE_MS = 3000;
+constexpr size_t MQTT_BUFFER_BYTES = 512; // Tasmota-BME280-JSON ist bereits >160 Byte.
 
 // Bisherige Netzwerkeinstellungen beibehalten.
 const char WIFI_SSID[] = "Wilsche";
@@ -218,7 +219,7 @@ void showNotification(const char *message, unsigned long now) {
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
-  char message[160];
+  char message[MQTT_BUFFER_BYTES];
   if (length >= sizeof(message)) return;
   memcpy(message, payload, length);
   message[length] = '\0';
@@ -386,6 +387,7 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Kein Warten auf WLAN.
   mqtt.setServer(MQTT_SERVER, 1883);
   mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(MQTT_BUFFER_BYTES);
   mqtt.setSocketTimeout(1); // MQTT-Antworten nicht unbegrenzt abwarten.
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
