@@ -1,556 +1,406 @@
 #include <Arduino.h>
-#include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Max72xxPanel.h>
-#include <time.h>
 #include <PubSubClient.h>
-//#include <FS.h>   //Include File System Headers
 #include <DHT.h>
-#define DHTTYPE DHT22
-// ToDo:
-// 
-//
-// Letzte Änderungen:
-// Matrix OFF Zeit verlägert auf 3s
-uint8_t DHTPin = 0;  //Pin DATA an DHT22
+#include <math.h>
+#include <time.h>
+#include "ThermostatLogic.h"
 
-int relais = 5;   //Pin für Relais Heizungsteuerung
-int setrelais = 0;  //Merker fürs Relais
-int setrelaisExtern = 2; //Merker für das andere Display
-int bewegung = 4;   //PIN für den Bewegungsmelder
-int tasterhoch = 3;  //Taster zum Temperatur erhöhen
-int tasterrunter = 2;//Taster zum Temp reduzieren
-int hoch =0;    //Merker Taster
-int runter=0;   //merker Taster
-int bewegungsstatus = 0;    //Zur Auswertung
-int bewegungzeit = 0;       //verzögerung
-//Arduino IDE Einstellung: Boards: ESP8266 (3.0.2) -> LOLIN (WEMOS) D1 R2 & mini
-// Programmiert von Nico Klingspohn. Anzeige von Uhrzeit + Solltemp. innen + Temperatur innen + Temp. Außen
-//Anzeige der Daten über MQTT. Einfach "13^ 11^ 09^" an "display1/text" senden. Sollte der TExt länger sein, wird automatisch Scrollen aktiviert.
-// LED Matrix Pin -> ESP8266 Pin
-// Vcc            -> 3v / 5v
-// Gnd            -> Gnd 
-// DIN            -> D7 
-// CS             -> D8  
-// CLK            -> D5
-float temperature;
-char aussendaten[150];
-float temperature_aussen;
-float humidity;
-int eylasses = 0;   //Spaß ;)
-int mqttsend = 550;   //Startwert kurz vor maximalwert (600), damit direkt MQTT Daten gesendet werden.
-WiFiClient espClient; 
-PubSubClient client(espClient); 
-bool starte = false;
-char tmp[50];
-String Text, Textdauerhaft; // Variable Text und Textdauerhaft wird angelegt. MQTT
-int speed = 1;  // Geschwindigkeit Variabel über MQTT änderbar. in ms
-int intensity = 5;  //Helligkeit über MQTT änderbar
-int scroll = 0;   //Scrollen Ja/Nein über MQTT
-int abstand = 6;  //line width via MQTT
-int runterzeit = 0;
-int hochzeit = 0;
-DHT dht(DHTPin, DHTTYPE);
-int pinCS = D8; // CS PIN der MAX7219 Matrix
-int numberOfHorizontalDisplays = 12; //Display Anzahl
-int numberOfVerticalDisplays   = 1; // Diplay höhen Anzahl
-char time_value[20];
-int mqttbewegung = 0;
-unsigned long bewegungZeitAus	=0;
+// Vor dem Flashen pro Geraet aendern: 1 = Holzwerkstatt, 2 = Metallwerkstatt.
+constexpr uint8_t DISPLAY_NUMBER = 1;
+static_assert(DISPLAY_NUMBER == 1 || DISPLAY_NUMBER == 2, "DISPLAY_NUMBER muss 1 oder 2 sein");
 
-Max72xxPanel matrix = Max72xxPanel(pinCS, numberOfHorizontalDisplays, numberOfVerticalDisplays);
-int wait = 30; // In millis -> Scrollgeschwindigkeit! 
-int spacer = 1;
-int width  = 5 + spacer; // Die Panals haben 5 Pixel + Leerzeichen
+// Diese zwei Werte muessen zur tatsaechlichen Relais-/Luefterverdrahtung passen.
+constexpr bool COOLING_MODE = false; // Heizluefter: Ein unter Soll, Aus ab Soll
+constexpr uint8_t RELAY_ON_LEVEL = HIGH;
 
-String newHostname = "Werkstatt-Holz-Display1";
-char ssid[] = "Wilsche";  //  SSID (name)
-char pass[] = "lsvgifhorn16";       // password
-const char* mqtt_server = "192.168.1.200"; //Broker IP Address
-const char* mqttUser = "Benutzer"; // Broker Name
-const char* mqttPassword = "Passwort"; // Broker Passwort
+constexpr float DEFAULT_SETPOINT = 8.0f;   // Nach jedem Neustart wieder 8 C
+constexpr float DEFAULT_HYSTERESIS = 2.0f; // Nach jedem Neustart wieder 2 C
+constexpr float MIN_SETPOINT = 0.0f;
+constexpr float MAX_SETPOINT = 40.0f;
+constexpr float SETPOINT_STEP = 0.5f;
+constexpr float MIN_HYSTERESIS = 0.1f;
+constexpr float MAX_HYSTERESIS = 10.0f;
 
+constexpr uint8_t DHT_PIN = 0;
+constexpr uint8_t RELAY_PIN = 5;
+constexpr uint8_t MOTION_PIN = 4;
+constexpr uint8_t UP_PIN = 3;
+constexpr uint8_t DOWN_PIN = 2;
+constexpr uint8_t MATRIX_CS_PIN = D8;
+constexpr uint8_t HORIZONTAL_DISPLAYS = 12;
+constexpr unsigned long SENSOR_INTERVAL_MS = 2500;
+constexpr unsigned long SENSOR_TIMEOUT_MS = 15000;
+constexpr unsigned long MQTT_INTERVAL_MS = 60000;
+constexpr unsigned long MQTT_RETRY_MS = 5000;
+constexpr unsigned long WIFI_RETRY_MS = 15000;
+constexpr unsigned long MOTION_OFF_DELAY_MS = 20000;
+constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
+constexpr unsigned long MATRIX_MUTE_MS = 3000;
 
-void connect_to_MQTT() {
- client.setServer(mqtt_server, 1883);//MQTT Server, - Port
- client.setCallback(callback); // aktiviert das zuhören 
- // Solltet Ihr kein Benutzer/Passwort haben so müssen folgende Zeilen entfernt werden: 
- // (client.connect("display" , mqttUser, mqttPassword))
- // und mit folgender getauscht werden: 
- // if (client.connect("display1");
-  if (client.connect("display1")) {
-    Serial.println("Verbinde zum MQTT Server");
-  } else {
-    Serial.println("zu MQTT Server nicht verbunden ");
-    if (!client.connect("display1")) {
-            Serial.print("Fehlgeschlagen, state=");
-            Serial.print(client.state());
-            Serial.println(" Versuch in 5 Sekunden nochmal");
-            delay(5000);
-        }
-  }
-  client.subscribe("display1/text");
-  client.subscribe("display1/speed");
-  client.subscribe("display1/scroll");
-  client.subscribe("display1/intensity");
-  client.subscribe("display1/abstand");
-  client.subscribe("tele/schalter2/SENSOR");
-  client.subscribe("display1/relais");
-  client.subscribe("display2/relais");    //für Display Abschaltung verwenden
-  // Alternativ steht folgende Alternative zur Verfügung: 
-  //client.subscribe("tropic/#"); --> es werden dann alle tropics abonniert ( Beispiel: Wohnzimmer/# )
-Textdauerhaft="Suche WLAN";
-client.publish("display1/LWT","ONLINE");
+// Bisherige Netzwerkeinstellungen beibehalten.
+const char WIFI_SSID[] = "Wilsche";
+const char WIFI_PASSWORD[] = "lsvgifhorn16";
+const char MQTT_SERVER[] = "192.168.1.200";
+
+struct Button {
+  uint8_t pin;
+  bool rawPressed;
+  bool stablePressed;
+  unsigned long changedAt;
+};
+
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+DHT dht(DHT_PIN, DHT22);
+Max72xxPanel matrix(MATRIX_CS_PIN, HORIZONTAL_DISPLAYS, 1);
+Button upButton = {UP_PIN, false, false, 0};
+Button downButton = {DOWN_PIN, false, false, 0};
+
+char ownRoot[12];
+char otherRoot[12];
+char hostname[32];
+char willTopic[24];
+float setpoint = DEFAULT_SETPOINT;
+float hysteresis = DEFAULT_HYSTERESIS;
+float insideTemperature = NAN;
+float outsideTemperature = NAN;
+float humidity = NAN;
+bool relayOn = false;
+bool sensorHasValue = false;
+bool motionActive = false;
+bool matrixMuted = false;
+bool forceScroll = false;
+int8_t otherRelayState = -1;
+uint8_t intensity = 5;
+uint8_t charSpacing = 6;
+char notice[100] = "";
+bool noticeScrolling = false;
+int noticeOffset = 0;
+unsigned long noticeUntil = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastValidSensor = 0;
+unsigned long lastMqttPublish = 0;
+unsigned long lastMqttAttempt = 0;
+unsigned long lastWifiAttempt = 0;
+unsigned long lastMotionHigh = 0;
+unsigned long matrixMuteUntil = 0;
+unsigned long lastFrame = 0;
+unsigned int scrollWaitMs = 30;
+
+bool elapsed(unsigned long now, unsigned long then, unsigned long interval) {
+  return (unsigned long)(now - then) >= interval;
 }
-        
+
+bool topicIs(const char *topic, const char *suffix) {
+  char expected[48];
+  snprintf(expected, sizeof(expected), "%s/%s", ownRoot, suffix);
+  return strcmp(topic, expected) == 0;
+}
+
+bool publish(const char *suffix, const char *value, bool retained = false) {
+  if (!mqtt.connected()) return false;
+  char topic[48];
+  snprintf(topic, sizeof(topic), "%s/%s", ownRoot, suffix);
+  return mqtt.publish(topic, value, retained);
+}
+
+void publishFloat(const char *suffix, float value, uint8_t decimals, bool retained = false) {
+  if (!isfinite(value)) return;
+  char text[16];
+  dtostrf(value, 1, decimals, text);
+  publish(suffix, text, retained);
+}
+
+void publishRelay() {
+  publish("relais", relayOn ? "1" : "0");
+}
+
+void publishTelemetry() {
+  if (sensorHasValue && !elapsed(millis(), lastValidSensor, SENSOR_TIMEOUT_MS)) {
+    publishFloat("temperature", insideTemperature, 1);
+    publishFloat("humidity", humidity, 0);
+  }
+  publish("LWT", "ONLINE", true);
+}
+
+bool parseNumber(const char *message, float &value, float minimum, float maximum) {
+  char *end = nullptr;
+  value = strtof(message, &end);
+  if (end == message || !isfinite(value)) return false;
+  while (*end == ' ' || *end == '\t') end++;
+  return *end == '\0' && value >= minimum && value <= maximum;
+}
+
+void setSetpoint(float value) {
+  if (!isfinite(value) || value < MIN_SETPOINT || value > MAX_SETPOINT) return;
+  value = roundf(value / SETPOINT_STEP) * SETPOINT_STEP;
+  if (fabsf(value - setpoint) < 0.01f) return;
+  setpoint = value;
+  publishFloat("solltemperatur", setpoint, 1, true);
+  Serial.printf("Solltemperatur: %.1f C\n", setpoint);
+}
+
+void setHysteresis(float value) {
+  if (!isfinite(value) || value < MIN_HYSTERESIS || value > MAX_HYSTERESIS) return;
+  value = roundf(value * 10.0f) / 10.0f;
+  if (fabsf(value - hysteresis) < 0.01f) return;
+  hysteresis = value;
+  publishFloat("hysterese", hysteresis, 1, true);
+  Serial.printf("Hysterese: %.1f C\n", hysteresis);
+}
+
+void muteMatrix(unsigned long now) {
+  if (!matrixMuted) {
+    matrix.shutdown(true);
+    matrixMuted = true;
+  }
+  matrixMuteUntil = now + MATRIX_MUTE_MS;
+}
+
+void updateRelay(unsigned long now) {
+  const bool sensorValid = sensorHasValue && !elapsed(now, lastValidSensor, SENSOR_TIMEOUT_MS);
+  bool wanted = nextRelayState(relayOn, insideTemperature, setpoint,
+                               hysteresis, sensorValid, COOLING_MODE);
+  if (wanted == relayOn) return;
+  muteMatrix(now);
+  relayOn = wanted;
+  digitalWrite(RELAY_PIN, relayOn ? RELAY_ON_LEVEL : (RELAY_ON_LEVEL == HIGH ? LOW : HIGH));
+  publishRelay();
+  Serial.printf("Relais: %s\n", relayOn ? "ein" : "aus");
+}
+
+void readSensor(unsigned long now) {
+  if (lastSensorRead != 0 && !elapsed(now, lastSensorRead, SENSOR_INTERVAL_MS)) return;
+  lastSensorRead = now;
+  float measuredTemperature = dht.readTemperature();
+  float measuredHumidity = dht.readHumidity();
+  if (isfinite(measuredTemperature) && measuredTemperature >= -40.0f && measuredTemperature <= 80.0f) {
+    insideTemperature = measuredTemperature;
+    sensorHasValue = true;
+    lastValidSensor = now;
+  }
+  if (isfinite(measuredHumidity) && measuredHumidity >= 0.0f && measuredHumidity <= 100.0f) {
+    humidity = measuredHumidity;
+  }
+}
+
+void checkButton(Button &button, const char *topic, float delta, unsigned long now) {
+  bool pressed = digitalRead(button.pin) == LOW;
+  if (pressed != button.rawPressed) {
+    button.rawPressed = pressed;
+    button.changedAt = now;
+  }
+  if (pressed == button.stablePressed || !elapsed(now, button.changedAt, BUTTON_DEBOUNCE_MS)) return;
+  button.stablePressed = pressed;
+  publish(topic, pressed ? "1" : "0"); // bisherige Taster-MQTT-Meldungen
+  if (pressed) setSetpoint(constrain(setpoint + delta, MIN_SETPOINT, MAX_SETPOINT));
+}
+
+void checkMotion(unsigned long now) {
+  if (digitalRead(MOTION_PIN) == HIGH) lastMotionHigh = now;
+  bool active = lastMotionHigh != 0 && !elapsed(now, lastMotionHigh, MOTION_OFF_DELAY_MS);
+  if (active == motionActive) return;
+  motionActive = active;
+  publish("bewegung", motionActive ? "1" : "0");
+}
+
+void showNotification(const char *message, unsigned long now) {
+  strncpy(notice, message, sizeof(notice) - 1);
+  notice[sizeof(notice) - 1] = '\0';
+  noticeScrolling = forceScroll || strlen(notice) > 12;
+  noticeOffset = matrix.width();
+  noticeUntil = now + 5000;
+}
+
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
+  char message[160];
+  if (length >= sizeof(message)) return;
+  memcpy(message, payload, length);
+  message[length] = '\0';
+  unsigned long now = millis();
+
+  if (topicIs(topic, "solltemperatur/set")) {
+    float value;
+    if (parseNumber(message, value, MIN_SETPOINT, MAX_SETPOINT)) setSetpoint(value);
+  } else if (topicIs(topic, "hysterese/set")) {
+    float value;
+    if (parseNumber(message, value, MIN_HYSTERESIS, MAX_HYSTERESIS)) setHysteresis(value);
+  } else if (topicIs(topic, "text")) {
+    if (strcmp(message, "RESET") == 0) ESP.restart();
+    showNotification(message, now);
+  } else if (topicIs(topic, "speed")) {
+    scrollWaitMs = constrain(atoi(message), 10, 500);
+  } else if (topicIs(topic, "scroll")) {
+    forceScroll = strcmp(message, "1") == 0;
+  } else if (topicIs(topic, "intensity")) {
+    intensity = constrain(atoi(message), 0, 15);
+    matrix.setIntensity(intensity);
+  } else if (topicIs(topic, "abstand")) {
+    charSpacing = constrain(atoi(message), 5, 8);
+  } else {
+    char otherRelayTopic[24];
+    snprintf(otherRelayTopic, sizeof(otherRelayTopic), "%s/relais", otherRoot);
+    if (strcmp(topic, otherRelayTopic) == 0 &&
+        (strcmp(message, "0") == 0 || strcmp(message, "1") == 0)) {
+      int8_t newState = message[0] - '0';
+      if (otherRelayState != -1 && otherRelayState != newState) muteMatrix(now);
+      otherRelayState = newState;
+    } else if (strcmp(topic, "tele/schalter2/SENSOR") == 0) {
+      // Optionaler Aussensensor. Keine Abhaengigkeit fuer die Innenraumregelung.
+      const char *field = strstr(message, "\"Temperature\":");
+      if (field != nullptr) {
+        float value = strtof(field + strlen("\"Temperature\":"), nullptr);
+        if (isfinite(value) && value >= -40.0f && value <= 80.0f) outsideTemperature = value;
+      }
+    }
+  }
+}
+
+void maintainConnections(unsigned long now) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (elapsed(now, lastWifiAttempt, WIFI_RETRY_MS)) {
+      lastWifiAttempt = now;
+      WiFi.reconnect();
+    }
+    return;
+  }
+  if (mqtt.connected()) {
+    mqtt.loop();
+    return;
+  }
+  if (!elapsed(now, lastMqttAttempt, MQTT_RETRY_MS)) return;
+  lastMqttAttempt = now;
+  if (!mqtt.connect(ownRoot, willTopic, 0, true, "OFFLINE")) return;
+  const char *inputs[] = {"text", "speed", "scroll", "intensity", "abstand",
+                          "solltemperatur/set", "hysterese/set"};
+  char topic[48];
+  for (const char *input : inputs) {
+    snprintf(topic, sizeof(topic), "%s/%s", ownRoot, input);
+    mqtt.subscribe(topic);
+  }
+  snprintf(topic, sizeof(topic), "%s/relais", otherRoot);
+  mqtt.subscribe(topic);
+  mqtt.subscribe("tele/schalter2/SENSOR");
+  publish("LWT", "ONLINE", true);
+  publishFloat("solltemperatur", setpoint, 1, true);
+  publishFloat("hysterese", hysteresis, 1, true);
+  publishRelay();
+  publish("bewegung", motionActive ? "1" : "0");
+  publishTelemetry();
+  lastMqttPublish = now;
+}
+
+void drawNumber(int x, float value) {
+  char label[4] = {'-', '-', '\0', '\0'};
+  if (isfinite(value)) {
+    int whole = (int)value;
+    if (whole >= 0 && whole <= 99) snprintf(label, sizeof(label), "%02d", whole);
+    else if (whole >= -9 && whole < 0) snprintf(label, sizeof(label), "%2d", whole);
+  }
+  matrix.drawChar(x, 0, label[0], HIGH, LOW, 1);
+  matrix.drawChar(x + 6, 0, label[1], HIGH, LOW, 1);
+  if (isfinite(value)) {
+    int bars = constrain((int)lroundf(fabsf(value - truncf(value)) * 8.0f), 0, 8);
+    for (int i = 0; i < bars; i++) matrix.drawPixel(x + i, 7, HIGH);
+  }
+}
+
+void render(unsigned long now) {
+  if (matrixMuted) {
+    if ((long)(now - matrixMuteUntil) < 0) return;
+    matrix.shutdown(false);
+    matrixMuted = false;
+  }
+  unsigned long frameInterval = notice[0] != '\0' && noticeScrolling ? scrollWaitMs : 100;
+  if (!elapsed(now, lastFrame, frameInterval)) return;
+  lastFrame = now;
+  matrix.fillScreen(LOW);
+  if (notice[0] != '\0') {
+    if (noticeScrolling) {
+      int length = strlen(notice);
+      for (int i = 0; i < length; i++) {
+        int x = noticeOffset + i * charSpacing;
+        if (x > -6 && x < matrix.width()) matrix.drawChar(x, 0, notice[i], HIGH, LOW, 1);
+      }
+      noticeOffset--;
+      if (noticeOffset + length * charSpacing < 0) notice[0] = '\0';
+    } else if ((long)(now - noticeUntil) < 0) {
+      for (size_t i = 0; i < strlen(notice); i++) {
+        int x = 26 + i * charSpacing;
+        if (x < matrix.width()) matrix.drawChar(x, 0, notice[i], HIGH, LOW, 1);
+      }
+    } else {
+      notice[0] = '\0';
+    }
+    if (notice[0] != '\0') {
+      matrix.write();
+      return;
+    }
+  }
+  char clockText[] = "--:--";
+  time_t clockNow = time(nullptr);
+  if (clockNow > 1700000000) {
+    struct tm localTime;
+    localtime_r(&clockNow, &localTime);
+    snprintf(clockText, sizeof(clockText), "%02d:%02d", localTime.tm_hour, localTime.tm_min);
+  }
+  const int clockX[] = {0, 6, 11, 16, 22};
+  for (int i = 0; i < 5; i++) matrix.drawChar(clockX[i], 0, clockText[i], HIGH, LOW, 1);
+  drawNumber(32, setpoint);
+  drawNumber(57, sensorHasValue && !elapsed(now, lastValidSensor, SENSOR_TIMEOUT_MS)
+                    ? insideTemperature : NAN);
+  drawNumber(82, outsideTemperature);
+  matrix.write();
+}
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  WiFi.hostname(newHostname.c_str());
-  WiFi.begin(ssid, pass);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-  dht.begin();    //DHT22 initialisieren
-  pinMode(bewegung, INPUT); //Der Pin mit dem Bewegungsmelder als Eingang.
-  pinMode(tasterhoch, INPUT); 
-  pinMode(tasterrunter, INPUT); 
-  pinMode(relais, OUTPUT);
-  
-/*
-  //Initialize File System
-  if(SPIFFS.begin()){
-    Serial.println("SPIFFS Initialisierung....OK");
-  } else {
-    Serial.println("SPIFFS Initialisierung...Fehler!");
-  }
-  //Format File System
-  if(SPIFFS.format()){
-    Serial.println("Datei-System formatiert");
-  } else {
-    Serial.println("Datei-System formatiert Error");
-  }
-  /*
-  File f = SPIFFS.open("/intensity.txt", "r");                                    //Lichtstärke auslesen
-  
-  if (!f) {
-    Serial.println("Oeffnen der Datei intensity fehlgeschlagen");
-  }
-  else
-  {
-      Serial.println("Lesen des Dateiinhaltes:");
-      //Data from file
-      String data = f.readString();
-      intensity = (data.toInt());
-      f.close();  //Schließen der Datei
-      Serial.println("intensity geschlossen");
-  }
-File f2 = SPIFFS.open("/speed.txt", "r");                                    //Speed (laufgeschwindigkeit auslesen
-  
-  if (!f2) {
-    Serial.println("Oeffnen der Datei speed fehlgeschlagen");
-  }
-  else
-  {
-      Serial.println("Lesen des Dateiinhaltes speed:");
-      //Data from file
-      String data = f2.readString();
-      wait = (data.toInt());
-      f2.close();  //Schließen der Datei
-      Serial.println("speed geschlossen");
-  }
-  */
-  connect_to_MQTT(); 
-  
-  configTime(0 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // Zeitserver.
-  setenv("TZ", "UTC",1);
-  matrix.setIntensity(intensity); // Lichtstärke einstellen! Bis 8 kann man sicherlich über den Wemos D1 mini ansteuern, alles darüber sollte das Netzteil aufgeteilt werden und direkt mit Strom versorgt werden!! 
-  matrix.setRotation(0, 1);    
-  matrix.setRotation(1, 1);    
-  matrix.setRotation(2, 1);    
-  matrix.setRotation(3, 1); 
-  matrix.setRotation(4, 1); 
-  matrix.setRotation(5, 1);
-  matrix.setRotation(6, 1);
-  matrix.setRotation(7, 1);
-  matrix.setRotation(8, 1);
-  matrix.setRotation(9, 1);
-  matrix.setRotation(10, 1);
-  matrix.setRotation(11, 1);
-  matrix.setRotation(12, 1);
-      //Relais:
-    char charrelais[2];
-    dtostrf(setrelais, 1, 0, charrelais);
-    client.publish("display1/relais",charrelais);
-    Serial.println("Relais geschaltet: " + String(charrelais));
+  snprintf(ownRoot, sizeof(ownRoot), "display%u", DISPLAY_NUMBER);
+  snprintf(otherRoot, sizeof(otherRoot), "display%u", DISPLAY_NUMBER == 1 ? 2 : 1);
+  snprintf(hostname, sizeof(hostname), "Werkstatt-%s-Display%u",
+           DISPLAY_NUMBER == 1 ? "Holz" : "Metall", DISPLAY_NUMBER);
+  snprintf(willTopic, sizeof(willTopic), "%s/LWT", ownRoot);
+
+  digitalWrite(RELAY_PIN, RELAY_ON_LEVEL == HIGH ? LOW : HIGH);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(MOTION_PIN, INPUT);
+  pinMode(UP_PIN, INPUT_PULLUP);
+  pinMode(DOWN_PIN, INPUT_PULLUP);
+  upButton.rawPressed = upButton.stablePressed = digitalRead(UP_PIN) == LOW;
+  downButton.rawPressed = downButton.stablePressed = digitalRead(DOWN_PIN) == LOW;
+  dht.begin();
+  matrix.setIntensity(intensity);
+  for (int i = 0; i < HORIZONTAL_DISPLAYS; i++) matrix.setRotation(i, 1);
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(hostname);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Kein Warten auf WLAN.
+  mqtt.setServer(MQTT_SERVER, 1883);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setSocketTimeout(1); // MQTT-Antworten nicht unbegrenzt abwarten.
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
+  Serial.printf("%s: Soll %.1f C, Hysterese %.1f C\n", hostname, setpoint, hysteresis);
 }
 
-void loop() {                                                                             // LOOP Start  HauptProgramm
-  matrix.setIntensity(intensity);     // Lichtstärke
-  humidity = dht.readHumidity();    //Luftfeuchte auslesen vom DHT22
-  if (humidity > 95) {              // ###################kleiner Spaß ;)
-    eylasses +=1;
-    if (eylasses <=1 ) {
-    Serial.println("jau 90er luftfeuchte");
-    Textdauerhaft = "Ey lass es!";
-    } else if (eylasses > 1000){
-      eylasses = 0;
-    } 
-  } else {
-    if (eylasses > 2){
-      Textdauerhaft = "Wieder OK !";
-    }
-    eylasses = 0;
+void loop() {
+  unsigned long now = millis();
+  readSensor(now);
+  checkButton(upButton, "hoch", SETPOINT_STEP, now);
+  checkButton(downButton, "runter", -SETPOINT_STEP, now);
+  checkMotion(now);
+  updateRelay(now);
+  maintainConnections(now);
+  if (mqtt.connected() && elapsed(now, lastMqttPublish, MQTT_INTERVAL_MS)) {
+    publishTelemetry();
+    lastMqttPublish = now;
   }
-
-  
-  temperature = dht.readTemperature();                        //Temperatur auslesen
- // Serial.print("Temperatur: ");
- // Serial.println(temperature);
- 
-												//##################Bewegung auswerten , 1=ON
- char charbew[2];
- if (bewegungsstatus != digitalRead(bewegung)){
-  if (bewegungsstatus == 1 || (bewegungsstatus == 2 && digitalRead(bewegung) == 1)) {       //letzter zustand war Ein -> jetzt AUS
-    bewegungZeitAus = millis();
-	bewegungsstatus = 2;		//2= AUS wurde erkannt
-  }
-
-  if (bewegungsstatus == 0) {
-    bewegungsstatus = digitalRead(bewegung);
-    dtostrf(bewegungsstatus, 1, 0, charbew);
-    client.publish("display1/bewegung",charbew);
-    Serial.println("Bewegung Ein gesendet: " + String(charbew));
-//  mqttbewegung = 1;
-  }
-  
-  if (bewegungsstatus == 2 && (bewegungZeitAus < (millis() - 20000)) ) {		//Verzögerungszeit für bewegungsmelder
-	bewegungsstatus = digitalRead(bewegung);
-	dtostrf(bewegungsstatus, 1, 0, charbew);
-	client.publish("display1/bewegung",charbew);
-	Serial.println("Bewegung Aus gesendet: " + String(charbew));
-  Serial.println("Zeit: " + String(millis()));
-  Serial.println("bewegungsuazeit " + String(bewegungZeitAus));
-    }
-}
-
- char charhoch[2];                        //######################Taster Auswertung. 0= gedrückt
-  if ((hoch!=digitalRead(tasterhoch)) || (hoch == 0 && digitalRead(tasterhoch) == 0 )){               
-    if (hoch == 0 && digitalRead(tasterhoch) == 0) {
-      hochzeit += 1;
-      if (hochzeit < 3) {
-        delay(100);
-        return; //sprung zurück zu loop()
-      }
-      client.publish("display1/hoch","1");
-      delay(100);
-    }
-    hochzeit = 0;     // zurücksetzen
-    hoch=digitalRead(tasterhoch);
-    dtostrf(hoch, 1, 0, charhoch);
-    client.publish("display1/hoch",charhoch);
-    Serial.println("Taster hoch: " + String(charhoch));
-    if (hoch == 0) {
-      matrix.fillScreen(LOW);
-      matrix.write();
-      delay(100);
-     }
-  }
-  char charrunter[2];
-  if ((runter!=digitalRead(tasterrunter)) || (runter == 0 && digitalRead(tasterrunter) == 0 )){              //Taster Auswertung. 0=gedrückt
-    if (runter == 0 && digitalRead(tasterrunter) == 0) {
-      runterzeit += 1;
-      if (runterzeit < 3) {
-        delay(100);
-        return; //sprung zurück zu loop()
-      }
-      client.publish("display1/runter","1");
-    }
-    runterzeit = 0;
-    runter=digitalRead(tasterrunter);
-    dtostrf(runter, 1, 0, charrunter);
-    client.publish("display1/runter",charrunter);
-    Serial.println("Taster runter: " + String(charrunter));
-     if (runter == 0) {
-      matrix.fillScreen(LOW);
-      matrix.write();
-      delay(100);
-     }
-     
-  }
-  if ((runter == 0) && (hoch == 0)) {
-    ESP.restart();                                    //#######################RESET wenn beide gedrückt sind.
-  }
-  if (Textdauerhaft == "RESET") {                                       //RESET, wenn Txt=RESET
-    ESP.restart();
-  }
-  
-  if (setrelais!=digitalRead(relais)){                                  //Relais Auswertung
-    char charrelais[2];
-    dtostrf(setrelais, 1, 0, charrelais);
-    client.publish("display1/relais",charrelais);
-    matrix.shutdown(1); //Aus
-    delay(500);
-    digitalWrite(relais, setrelais);
-    delay(3000);
-    matrix.shutdown(0); //Wieder an
-    Serial.println("Relais geschaltet: " + String(charrelais));    
-  }
-  
-     
-  mqttsend += 1;                                           //################Ersten Teil Alle 600 mal (60Sek.) ausführen (und beim startmqtt=300=
-  if (mqttsend >= 600) {
-    char chartemp[10]; 
-    char charhum[10];
-    char charbew[10];
-    dtostrf(temperature, 3, 1, chartemp);
-    dtostrf(humidity, 3, 0, charhum);
-    client.publish("display1/temperature",chartemp);
-    Serial.println("Temperatur gesendet: " + String(chartemp));
-    client.publish("display1/humidity",charhum);
-    Serial.println("Luftfeuchte gesendet: " + String(charhum));
-    //LWT
-    client.publish("display1/LWT","ONLINE");
-
-    
-    mqttsend = 0;
-  }      
-  
-  matrix.fillScreen(LOW);
-  time_t now = time(nullptr);
-  String time = String(ctime(&now));
-  time.trim();
-  //Serial.println(time);
-  time.substring(11,19).toCharArray(time_value, 10);                        //Zeit Anzeige
-  matrix.drawChar(0,0, time_value[0], HIGH,LOW,1); // H
-  matrix.drawChar(6,0, time_value[1], HIGH,LOW,1); // HH
-  matrix.drawChar(11,0,time_value[2], HIGH,LOW,1); // HH: (weniger Abstand 1)
-  matrix.drawChar(16,0,time_value[3], HIGH,LOW,1); // HH:M
-  matrix.drawChar(22,0,time_value[4], HIGH,LOW,1); // HH:MM
-  int zeichenpos = 25;
-  // time_value[6] ---> 10er Schritte /*10
-  // time_value[7]--->1er Schritte  /+ Val6
-//Serial.println(time.substring(18,19));   
-
-                                                //Nach der Uhrzeit Temperatur usw. Anzeigen. Dauerhaft:
-  if (Textdauerhaft.isEmpty()){
-    Textdauerhaft = "Starte...";
-  }
-  int jump = 0;
-  int anzahljumps = 0;
-  for (int i= 0 ; i < Textdauerhaft.length(); i++) {
-    if (jump ==1) {
-      jump = 0;
-      anzahljumps += 1;
-      continue;
-    }
-    if (anzahljumps ==2){
-      zeichenpos += 3;
-      anzahljumps = 8;                              //weiter verwendet, zur genauen Temp anzeige
-    }
-    char str1[100];                                 //   ^ Zeichen? dann kürzeren Abstand!*************
-    String Textcheck = String(Textdauerhaft[i]);    //Convert to String   #
-    strcpy(str1, Textcheck.c_str());                                  //  #
-    char str2[] = "^";                                               //   #
-    if (strcmp(str1, str2)==0){                                        // #
-    matrix.drawChar((zeichenpos += abstand),0,Textdauerhaft[i], HIGH,LOW,1);
-        zeichenpos += 4;                                             //  #
-        jump = 1; //nächste Zeile überspringen (leerzeichen)
-    continue;                   //Leerzeichen? dann kürzeren Abstand!*************
-  }
-    matrix.drawChar((zeichenpos += abstand),0,Textdauerhaft[i], HIGH,LOW,1);                //Anzeige des Textes, wenn er kurz genug ist.
-    //Serial.println("Matrix.drawChar " + String(Textdauerhaft[i]));
-  }
-  if (anzahljumps == 8 ) {    //Anzeige der Temperatur hinter Komma, Binär unter der Zahl
-      uint16_t daten_in;
-      daten_in = (int)(temperature);
-      daten_in= daten_in << 8;
-      daten_in= (temperature - (daten_in >> 8))*10;
-      uint16_t daten_aussen;
-      daten_aussen = (int)(temperature_aussen);
-      daten_aussen= daten_aussen << 8;
-      daten_aussen= (temperature_aussen - (daten_aussen >> 8))*10;
-      //Serial.println(daten_in);
-      int binstartinnen = 54;             // Untere Leiste, startpunkt auf X
-      int binstartaussen = 84;    // Untere Leiste, Startpunkt auf X für 3. Wert
-    for (int a=1; a <= daten_aussen; a++){              //Ist Temperatur (aussen) (Kommazahl)
-        matrix.drawPixel(binstartaussen + a,7,1);   //X=Rechts Y=Runter
-      }
-      for (int a=1; a <= daten_in; a++){                //Ist Temperatur (mitte,innen)(Kommazahl)
-        matrix.drawPixel(binstartinnen + a,7,1);    //X=Rechts Y=Runter
-      }
-      
-    int sek = int(time_value[6]-48) * 10 + int(time_value[7]-48);
-    int sekDurch2 = sek / 2 - 2;
-    for (int i = 0; i <= sekDurch2; i++){               //Sekunden unter der Zeit als Punkte anzeigen. (60/2)
-      matrix.drawPixel(i,7,1);
-    }
-  }   
-  matrix.write(); // Bitmap an das Display senden.
-  delay(100);
-  if (!client.connected()) {
-    Serial.println("Keine Verbindung zum MQTT Server");
-  Textdauerhaft = "Kein MQTT";
-    connect_to_MQTT();
-  }
-  client.loop();            // Ende von void loop, MQTT "refresher"
-}
-
-void display_message(String message){   //Anzeige von Nachrichten, die zu lang sind . Sie werden Eingescrollt
-  
-   for ( int i = 0 ; i < width * message.length() + matrix.width() - spacer; i++ ) {
-    //matrix.fillScreen(LOW);
-    int letter = i / width;
-    int x = (matrix.width() - 1) - i % width; //fängt hinten an. geht mit i immer weiter nach vorn. %width für vorne anfangen?
-    int y = (matrix.height() - 8) / 2; // Zentriert die Ausgabe.
-    while ( x + width - spacer >= 0 && letter >= 0 ) {  //
-      if ( letter < message.length() ) {
-        matrix.drawChar(x, y, message[letter], HIGH, LOW, 1); // HIGH LOW 
-      }
-      letter--;
-      x -= width;
-    }
-    matrix.write(); // Bitmap an das Display senden.
-    delay(wait);
-  }
-}
-
-//Auswertung der MQTT NCHRICHTEN
-void callback(char* topic, byte* payload, unsigned int length) {
- // Zähler
- int i = 0;
- // Hilfsvariablen für die Convertierung der Nachricht in ein String
- char message_buff[100];
- Serial.println("Message arrived: topic: " + String(topic));
- Serial.println("Length: " + String(length,DEC));
- // Kopieren der Nachricht und erstellen eines Bytes mit abschließender \0
- for(i=0; i<length; i++) {
- message_buff[i] = payload[i];
- }
- message_buff[i] = '\0';
- 
- // Konvertierung der nachricht in ein String
- String msgString = String(message_buff);
- Serial.println("Payload: " + msgString);
-/*
-if (strcmp(topic,"display1/bewegung")==0){
-  mqttbewegung = msgString.toInt(); //Konvertierung nach int?!. Nur die Zahl auslesen 
-  Serial.println("bewegungreceived:" + msgString);
-}
-*/
- if (strcmp(topic,"display1/speed")==0){
-   wait = msgString.toInt(); //Konvertierung nach int?!. Nur die Zahl auslesen 
- /*
-     File f = SPIFFS.open("/speed.txt", "w");
-  if (!f) {
-    Serial.println("Oeffnen der Datei speed.txt fehlgeschlagen");
-  }
-  else
-  {
-      Serial.println("Schreibe Daten in die Datei speed.txt");
-      f.print(wait);
-      f.close();  //Schließen der Datei
-  }
-   
-  */
- }
- if (strcmp(topic,"display1/scroll")==0){
-   scroll = msgString.toInt();  //Konvertierung nach int?!. Nur die Zahl auslesen, 
-   Serial.println("text:" + msgString);
-  }
-
- if (strcmp(topic,"display1/intensity")==0){
-   intensity = msgString.toInt(); //Konvertierung nach int?!. Nur die Zahl auslesen
-   /*
-  File f = SPIFFS.open("/intensity.txt", "w");
-  if (!f) {
-    Serial.println("Oeffnen der Datei intensity.txt fehlgeschlagen");
-  }
-  else
-  {
-      //Write data to file
-      Serial.println("Schreibe Daten in die Datei intensity.txt");
-      f.print(intensity);
-
-      f.close();  //Schließen der Datei
-  } 
-  */
-  }
- if (strcmp(topic,"display1/relais")==0){
-   setrelais = msgString.toInt(); //Konvertierung nach int?!. Nur die Zahl auslesen, ohne /0 an Ende  
-  }
-if (strcmp(topic,"display2/relais")==0){
-  if (setrelaisExtern != msgString.toInt()) {
-   //Egal welcher Schaltzustand des anderen Displays empfangen wird, das Display soll immer kurz ausgehen, damit es keine Matrix Störungen gibt...
-    matrix.shutdown(1); //Aus
-    setrelaisExtern = msgString.toInt();
-    delay(3000);	// Geändert vn 1500 auf 3000
-    matrix.shutdown(0); //Wieder an
-  }
-}
-
- if (strcmp(topic,"tele/schalter2/SENSOR")==0){
-   strcpy(aussendaten, msgString.c_str()); //Konvertierung, bzw. Auslesen der Temp. aus dem JSON
-  const char temp55[] = "Temperature\":";
-  Serial.print("temp55:");
-  Serial.print(temp55);
-char* ptr = strstr(aussendaten, temp55);
-  if (ptr)
-  {
-    temperature_aussen = atof(ptr + strlen(temp55));
-    Serial.println(temperature_aussen, 4);
-  }
-  }
- if (strcmp(topic,"display1/abstand")==0){
-   abstand = msgString.toInt(); //Konvertierung nach int?!. Nur die Zahl auslesen, ohne /0 an Ende  
-  }
-  if (strcmp(topic,"display1/text")==0){
-    if (length > 12) {
-      Text = msgString;
-    display_message(Text);
-    } else if (scroll == 1) {
-    Text = msgString;
-    display_message(Text);
-    display_message(Text);
-  } else {
-    Textdauerhaft = msgString;
-  }
-  }
-  
-  /*
-  Zum freimachen, das "/*" und am ende "* /" entfernen!
-    
-  ################################################ 
-  ## Tropic filtern und etwas bestimmtes machen!#
-  ################################################
-  
-  if (strcmp(topic,"display1/verbraucht")==0){
-    Text = "Internet verbraucht: " + msgString + "Std.";
-  display_message(Text);
-  display_message(Text);
-  }
-  if (strcmp(topic,"display1/woche")==0){
-    Text = "Woche Gesamt: " + msgString + "Std.";
-  display_message(Text);
-  display_message(Text);
-  }
-  
-     //  char str1[100];             //Leerzeichen? dann kürzeren Abstand!*************
-  //  String Textcheck = String(Textdauerhaft[i]);    //Convert to String   #
-  //  strcpy(str1, Textcheck.c_str());                                  //  #
-  //  char str2[] = " ";                                               //   #
-  //  if (strcmp(str1, str2)==0){                                        // #
-   // zeichenpos += spacer;                                             //  #
-   // continue;                   //Leerzeichen? dann kürzeren Abstand!*************
-  //}
-*/
- 
+  render(now);
+  yield();
 }
