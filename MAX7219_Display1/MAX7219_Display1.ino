@@ -41,6 +41,8 @@ constexpr unsigned long MQTT_RETRY_MS = 5000;
 constexpr unsigned long WIFI_RETRY_MS = 15000;
 constexpr unsigned long MOTION_OFF_DELAY_MS = 20000;
 constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
+constexpr unsigned long BUTTON_REPEAT_DELAY_MS = 550;
+constexpr unsigned long BUTTON_REPEAT_INTERVAL_MS = 400;
 constexpr unsigned long MATRIX_MUTE_MS = 3000;
 constexpr size_t MQTT_BUFFER_BYTES = 512; // Tasmota-BME280-JSON ist bereits >160 Byte.
 
@@ -54,14 +56,16 @@ struct Button {
   bool rawPressed;
   bool stablePressed;
   unsigned long changedAt;
+  unsigned long pressedAt;
+  unsigned long lastRepeatAt;
 };
 
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 DHT dht(DHT_PIN, DHT22);
 Max72xxPanel matrix(MATRIX_CS_PIN, HORIZONTAL_DISPLAYS, 1);
-Button upButton = {UP_PIN, false, false, 0};
-Button downButton = {DOWN_PIN, false, false, 0};
+Button upButton = {UP_PIN, false, false, 0, 0, 0};
+Button downButton = {DOWN_PIN, false, false, 0, 0, 0};
 
 char ownRoot[12];
 char otherRoot[12];
@@ -239,10 +243,22 @@ void checkButton(Button &button, const char *topic, float delta, unsigned long n
     button.rawPressed = pressed;
     button.changedAt = now;
   }
-  if (pressed == button.stablePressed || !elapsed(now, button.changedAt, BUTTON_DEBOUNCE_MS)) return;
-  button.stablePressed = pressed;
-  publish(topic, pressed ? "1" : "0"); // bisherige Taster-MQTT-Meldungen
-  if (pressed) setSetpoint(constrain(setpoint + delta, MIN_SETPOINT, MAX_SETPOINT));
+  if (pressed != button.stablePressed) {
+    if (!elapsed(now, button.changedAt, BUTTON_DEBOUNCE_MS)) return;
+    button.stablePressed = pressed;
+    publish(topic, pressed ? "1" : "0"); // Nur Flanken, keine MQTT-Tasterflut beim Halten.
+    if (pressed) {
+      button.pressedAt = now;
+      button.lastRepeatAt = now;
+      setSetpoint(constrain(setpoint + delta, MIN_SETPOINT, MAX_SETPOINT));
+    }
+    return;
+  }
+  if (pressed && elapsed(now, button.pressedAt, BUTTON_REPEAT_DELAY_MS) &&
+      elapsed(now, button.lastRepeatAt, BUTTON_REPEAT_INTERVAL_MS)) {
+    button.lastRepeatAt = now;
+    setSetpoint(constrain(setpoint + delta, MIN_SETPOINT, MAX_SETPOINT));
+  }
 }
 
 void checkMotion(unsigned long now) {
@@ -428,6 +444,8 @@ void setup() {
   pinMode(DOWN_PIN, INPUT_PULLUP);
   upButton.rawPressed = upButton.stablePressed = digitalRead(UP_PIN) == LOW;
   downButton.rawPressed = downButton.stablePressed = digitalRead(DOWN_PIN) == LOW;
+  upButton.pressedAt = upButton.lastRepeatAt = millis();
+  downButton.pressedAt = downButton.lastRepeatAt = millis();
   dht.begin();
   matrix.setIntensity(intensity);
   for (int i = 0; i < HORIZONTAL_DISPLAYS; i++) matrix.setRotation(i, 1);
