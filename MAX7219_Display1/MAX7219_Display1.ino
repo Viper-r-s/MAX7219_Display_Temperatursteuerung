@@ -12,7 +12,7 @@
 #include "SetpointStorage.h"
 
 // Vor dem Flashen pro Geraet aendern: 1 = Holzwerkstatt, 2 = Metallwerkstatt.
-constexpr uint8_t DISPLAY_NUMBER = 1;
+constexpr uint8_t DISPLAY_NUMBER = 2;
 static_assert(DISPLAY_NUMBER == 1 || DISPLAY_NUMBER == 2, "DISPLAY_NUMBER muss 1 oder 2 sein");
 
 // Diese zwei Werte muessen zur tatsaechlichen Relais-/Luefterverdrahtung passen.
@@ -41,8 +41,10 @@ constexpr unsigned long MQTT_RETRY_MS = 5000;
 constexpr unsigned long WIFI_RETRY_MS = 15000;
 constexpr unsigned long MOTION_OFF_DELAY_MS = 20000;
 constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
-constexpr unsigned long BUTTON_REPEAT_DELAY_MS = 550;
-constexpr unsigned long BUTTON_REPEAT_INTERVAL_MS = 400;
+constexpr unsigned long BUTTON_REPEAT_DELAY_MS = 300; // Bereits nach 0,3 s startet das automatische Hoch-/Runterzaehlen.
+constexpr unsigned long BUTTON_REPEAT_INTERVAL_MS = 150; // Danach alle 0,15 s um 1 Grad aendern.
+constexpr unsigned long BUTTON_CHORD_WINDOW_MS = 200; // Tasten innerhalb von 200 ms gleichzeitig druecken.
+constexpr unsigned long EASTER_EGG_SEQUENCE_TIMEOUT_MS = 4000; // Max. Pause zwischen Doppeldruecken.
 constexpr unsigned long MATRIX_MUTE_MS = 3000;
 constexpr size_t MQTT_BUFFER_BYTES = 512; // Tasmota-BME280-JSON ist bereits >160 Byte.
 
@@ -58,14 +60,19 @@ struct Button {
   unsigned long changedAt;
   unsigned long pressedAt;
   unsigned long lastRepeatAt;
+  bool actionTaken;             // Einzel-Tastendruck wurde bereits verarbeitet.
+  bool suppressUntilRelease;    // Doppeldruck darf die Solltemperatur nicht aendern.
 };
 
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 DHT dht(DHT_PIN, DHT22);
 Max72xxPanel matrix(MATRIX_CS_PIN, HORIZONTAL_DISPLAYS, 1);
-Button upButton = {UP_PIN, false, false, 0, 0, 0};
-Button downButton = {DOWN_PIN, false, false, 0, 0, 0};
+Button upButton = {UP_PIN, false, false, 0, 0, 0, false, false};
+Button downButton = {DOWN_PIN, false, false, 0, 0, 0, false, false};
+bool chordLocked = false; // Ein Doppeldruck zaehlt erst nach dem Loslassen beider Tasten erneut.
+uint8_t consecutiveChords = 0;
+unsigned long lastChordAt = 0;
 
 char ownRoot[12];
 char otherRoot[12];
@@ -237,28 +244,93 @@ void readSensor(unsigned long now) {
   }
 }
 
-void checkButton(Button &button, const char *topic, float delta, unsigned long now) {
-  bool pressed = digitalRead(button.pin) == LOW;
+// Wird unten in der vorhandenen Anzeigelogik definiert.
+void showNotification(const char *message, unsigned long now);
+
+void applyButtonStep(Button &button, float delta) {
+  consecutiveChords = 0; // Ein einzelner Tastendruck unterbricht die Easter-Egg-Folge.
+  button.actionTaken = true;
+  setSetpoint(constrain(setpoint + delta, MIN_SETPOINT, MAX_SETPOINT));
+}
+
+// Beide Tasten zuerst entprellen, danach gemeinsam auswerten.
+// Dadurch zaehlt ein Doppeldruck weder als Hoch- noch als Runter-Tastendruck.
+void sampleButton(Button &button, const char *topic, float delta, unsigned long now) {
+  const bool pressed = digitalRead(button.pin) == LOW;
   if (pressed != button.rawPressed) {
     button.rawPressed = pressed;
     button.changedAt = now;
   }
-  if (pressed != button.stablePressed) {
-    if (!elapsed(now, button.changedAt, BUTTON_DEBOUNCE_MS)) return;
-    button.stablePressed = pressed;
-    publish(topic, pressed ? "1" : "0"); // Nur Flanken, keine MQTT-Tasterflut beim Halten.
-    if (pressed) {
-      button.pressedAt = now;
-      button.lastRepeatAt = now;
-      setSetpoint(constrain(setpoint + delta, MIN_SETPOINT, MAX_SETPOINT));
+  if (pressed == button.stablePressed || !elapsed(now, button.changedAt, BUTTON_DEBOUNCE_MS)) return;
+
+  button.stablePressed = pressed;
+  publish(topic, pressed ? "1" : "0"); // Weiterhin nur Flanken via MQTT melden.
+  if (pressed) {
+    button.pressedAt = now;
+    button.lastRepeatAt = now;
+    button.actionTaken = false;
+    button.suppressUntilRelease = chordLocked;
+  } else {
+    // Kurze normale Tastendruecke duerfen nicht verloren gehen.
+    if (!button.actionTaken && !button.suppressUntilRelease && !chordLocked) {
+      applyButtonStep(button, delta);
     }
+    button.suppressUntilRelease = false;
+  }
+}
+
+void repeatOrApplyButton(Button &button, float delta, unsigned long now) {
+  if (!button.stablePressed || !button.rawPressed || button.suppressUntilRelease) return; // Beim Loslassen nicht weiterzaehlen.
+
+  if (!button.actionTaken) {
+    // Kurze Schonfrist: So kann die zweite Taste noch einen Doppeldruck bilden.
+    if (elapsed(now, button.pressedAt, BUTTON_CHORD_WINDOW_MS)) {
+      applyButtonStep(button, delta);
+    }
+  } else if (elapsed(now, button.pressedAt, BUTTON_REPEAT_DELAY_MS) &&
+             elapsed(now, button.lastRepeatAt, BUTTON_REPEAT_INTERVAL_MS)) {
+    button.lastRepeatAt = now;
+    applyButtonStep(button, delta);
+  }
+}
+
+void checkButtons(unsigned long now) {
+  sampleButton(upButton, "hoch", SETPOINT_STEP, now);
+  sampleButton(downButton, "runter", -SETPOINT_STEP, now);
+
+  if (chordLocked) {
+    // Festhalten oder nur eine der beiden Tasten loslassen zaehlt nicht erneut.
+    if (!upButton.stablePressed && !downButton.stablePressed) chordLocked = false;
     return;
   }
-  if (pressed && elapsed(now, button.pressedAt, BUTTON_REPEAT_DELAY_MS) &&
-      elapsed(now, button.lastRepeatAt, BUTTON_REPEAT_INTERVAL_MS)) {
-    button.lastRepeatAt = now;
-    setSetpoint(constrain(setpoint + delta, MIN_SETPOINT, MAX_SETPOINT));
+
+  if (upButton.stablePressed && downButton.stablePressed &&
+      !upButton.actionTaken && !downButton.actionTaken &&
+      !upButton.suppressUntilRelease && !downButton.suppressUntilRelease) {
+    // Auch beim Ueberlauf von millis() bleibt die Zeitdifferenz korrekt.
+    unsigned long gap = upButton.pressedAt - downButton.pressedAt;
+    if (gap > BUTTON_CHORD_WINDOW_MS) gap = downButton.pressedAt - upButton.pressedAt;
+    if (gap <= BUTTON_CHORD_WINDOW_MS) {
+      chordLocked = true;
+      upButton.suppressUntilRelease = true;
+      downButton.suppressUntilRelease = true;
+
+      if (consecutiveChords > 0 &&
+          elapsed(now, lastChordAt, EASTER_EGG_SEQUENCE_TIMEOUT_MS)) {
+        consecutiveChords = 0;
+      }
+      lastChordAt = now;
+      ++consecutiveChords;
+      if (consecutiveChords == 3) {
+        consecutiveChords = 0;
+        showNotification("AZB-Arne macht alles kaputt", now);
+      }
+      return;
+    }
   }
+
+  repeatOrApplyButton(upButton, SETPOINT_STEP, now);
+  repeatOrApplyButton(downButton, -SETPOINT_STEP, now);
 }
 
 void checkMotion(unsigned long now) {
@@ -414,9 +486,9 @@ void render(unsigned long now) {
   char clockText[] = "--:--";
   time_t clockNow = time(nullptr);
   if (clockNow > 1700000000) {
-    struct tm localTime;
-    localtime_r(&clockNow, &localTime);
-    snprintf(clockText, sizeof(clockText), "%02d:%02d", localTime.tm_hour, localTime.tm_min);
+    struct tm utcTime;
+    gmtime_r(&clockNow, &utcTime);
+    snprintf(clockText, sizeof(clockText), "%02d:%02d", utcTime.tm_hour, utcTime.tm_min);
   }
   const int clockX[] = {0, 6, 11, 16, 22};
   for (int i = 0; i < 5; i++) matrix.drawChar(clockX[i], 0, clockText[i], HIGH, LOW, 1);
@@ -446,6 +518,9 @@ void setup() {
   downButton.rawPressed = downButton.stablePressed = digitalRead(DOWN_PIN) == LOW;
   upButton.pressedAt = upButton.lastRepeatAt = millis();
   downButton.pressedAt = downButton.lastRepeatAt = millis();
+  // Falls beim Einschalten ein Taster gehalten wird: erst nach dem Loslassen zaehlen.
+  upButton.suppressUntilRelease = upButton.stablePressed;
+  downButton.suppressUntilRelease = downButton.stablePressed;
   dht.begin();
   matrix.setIntensity(intensity);
   for (int i = 0; i < HORIZONTAL_DISPLAYS; i++) matrix.setRotation(i, 1);
@@ -459,7 +534,7 @@ void setup() {
   mqtt.setBufferSize(MQTT_BUFFER_BYTES);
   mqtt.setSocketTimeout(1); // MQTT-Antworten nicht unbegrenzt abwarten.
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  setenv("TZ", "UTC0", 1); // Die angezeigte Uhrzeit bleibt ganzjaehrig UTC.
   tzset();
   Serial.printf("%s: Soll %.1f C, Hysterese %.1f C\n", hostname, setpoint, hysteresis);
 }
@@ -467,8 +542,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   readSensor(now);
-  checkButton(upButton, "hoch", SETPOINT_STEP, now);
-  checkButton(downButton, "runter", -SETPOINT_STEP, now);
+  checkButtons(now);
   checkMotion(now);
   updateRelay(now);
   maintainConnections(now);
